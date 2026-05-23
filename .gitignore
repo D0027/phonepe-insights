@@ -1,0 +1,22 @@
+# Data (large files — do not commit)
+data/pulse/
+data/*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Outputs (generated charts)
+outputs/*.png
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db

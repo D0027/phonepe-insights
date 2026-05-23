@@ -1,0 +1,22 @@
+# PhonePe Transaction Insights — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+numpy>=1.24
+pandas>=2.0
+
+# Database
+# sqlite3 is built into Python — no install needed
+
+# Visualization (EDA scripts)
+matplotlib>=3.7
+seaborn>=0.12
+
+# Visualization (Streamlit dashboard)
+plotly>=5.18
+
+# Dashboard
+streamlit>=1.30
+
+# Git cloning
+gitpython>=3.1
