@@ -10,8 +10,7 @@ __pycache__/
 venv/
 env/
 
-# Outputs (generated charts)
-outputs/*.png
+
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
