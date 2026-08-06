@@ -1,6 +1,5 @@
 # Data (large files — do not commit)
 data/pulse/
-data/*.db
 
 # Python
 __pycache__/
@@ -9,8 +8,6 @@ __pycache__/
 .venv/
 venv/
 env/
-
-
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
