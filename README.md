@@ -7,7 +7,7 @@
 ![SQLite](https://img.shields.io/badge/SQLite-3-003B57?style=flat&logo=sqlite&logoColor=white)
 ![Plotly](https://img.shields.io/badge/Plotly-5.18+-3F4F75?style=flat&logo=plotly&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat)
-
+[![Live Demo](https://img.shields.io/badge/Streamlit-Live%20Demo-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://phonepe-insights-027.streamlit.app/)
 ---
 
 ## 📌 What This Project Does
