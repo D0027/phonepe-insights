@@ -1,5 +1,5 @@
 """
-PhonePe Transaction Insights — Streamlit Dashboard (Premium Edition)
+PhonePe Transaction Insights — Streamlit Dashboard (Premium Edition v2)
 ======================================================================
 Run with:
     streamlit run dashboard/app.py
@@ -13,10 +13,24 @@ FIXES applied vs original:
            empty but df_quarterly was not.
   FIX 3 — Insurance "Top States" SQL now respects sel_years / sel_quarters
            sidebar filters instead of silently querying the entire table.
+  FIX 4 (NEW) — load_data() now validates ALL required tables exist in the
+           committed .db before trusting it. If incomplete/stale, deletes and
+           rebuilds from source instead of silently serving a broken DB.
+           This was the root cause of "no such table: aggregated_user".
+  FIX 5 (NEW) — df_brand / df_user_raw no longer run raw SQL directly against
+           `conn` (which crashes hard if the table is missing). They're now
+           built from TABLE_MAP with pandas groupby, with a graceful fallback.
+
+NEW FEATURES:
+  - Sidebar "🔄 Refresh Data" button — clears cache, forces DB reload live.
+  - CSV download buttons on the Overview table and Top States chart.
+  - YoY delta badges on the 5 headline KPI metrics.
+  - Data freshness caption (row counts + last DB modified time).
 """
 
 import os, json, sqlite3, subprocess, sys, warnings
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -32,6 +46,12 @@ BASE_DIR   = Path(__file__).resolve().parent.parent
 DB_PATH    = BASE_DIR / "data" / "phonepe_pulse.db"
 CLONE_PATH = BASE_DIR / "data" / "pulse"
 REPO_URL   = "https://github.com/PhonePe/pulse.git"
+
+REQUIRED_TABLES = {
+    "aggregated_transaction", "aggregated_user", "aggregated_insurance",
+    "map_transaction", "map_user", "map_insurance",
+    "top_transaction", "top_user", "top_insurance",
+}
 
 # ── Design Tokens ─────────────────────────────────────────────────────────────
 C_BG        = "#07050F"
@@ -220,6 +240,23 @@ st.markdown(f"""
     border: 1px solid {C_BORDER} !important;
   }}
 
+  /* ── Buttons (NEW) ── */
+  .stButton > button, .stDownloadButton > button {{
+    background: linear-gradient(135deg, {C_PURPLE2}, {C_INDIGO}) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-size: 12.5px !important;
+    font-weight: 600 !important;
+    padding: 8px 14px !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 2px 10px rgba(124,58,237,0.25) !important;
+  }}
+  .stButton > button:hover, .stDownloadButton > button:hover {{
+    transform: translateY(-1px);
+    box-shadow: 0 6px 18px rgba(124,58,237,0.4) !important;
+  }}
+
   /* ── Insight card ── */
   .insight-card {{
     background: linear-gradient(135deg, rgba(19,15,34,0.9), rgba(26,21,48,0.9));
@@ -396,6 +433,14 @@ st.markdown(f"""
   .stDataFrame [data-testid="stDataFrameResizable"] {{
     background: {C_CARD} !important;
   }}
+
+  /* ── Freshness caption (NEW) ── */
+  .freshness-caption {{
+    font-size: 11px;
+    color: {C_MUTED2};
+    font-family: 'JetBrains Mono', monospace;
+    margin-top: 6px;
+  }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -427,6 +472,11 @@ def section_header(title, sub=""):
     st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
     if sub:
         st.markdown(f'<div class="section-sub">{sub}</div>', unsafe_allow_html=True)
+
+@st.cache_data
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """NEW: cache CSV encoding so repeated download-button renders are cheap."""
+    return df.to_csv(index=False).encode("utf-8")
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────────
@@ -536,14 +586,8 @@ def parse_top_insurance(dp):
 
 
 # ── Data Loader ───────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def load_data():
-    if DB_PATH.exists():
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist()
-        tmap = {t: pd.read_sql(f"SELECT * FROM {t}", conn) for t in tables}
-        return conn, tmap
-
+def _rebuild_from_source():
+    """NEW: split out so both the fallback path AND the 'incomplete DB' path can call it."""
     try:
         from git import Repo
     except ImportError:
@@ -582,6 +626,38 @@ def load_data():
     return conn, tmap
 
 
+@st.cache_resource(show_spinner=False)
+def load_data():
+    if DB_PATH.exists():
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        tables = set(pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist())
+
+        # FIX 4 (NEW): validate the committed/cached db actually has every table
+        # we depend on. A partial or stale db (e.g. one committed mid-build, or
+        # one where a parser failed silently in a previous run) used to get
+        # trusted blindly here — that's exactly what caused
+        # "no such table: aggregated_user" in production.
+        if REQUIRED_TABLES.issubset(tables):
+            tmap = {t: pd.read_sql(f"SELECT * FROM {t}", conn) for t in tables}
+            return conn, tmap
+        else:
+            missing = REQUIRED_TABLES - tables
+            st.warning(f"⚠️ Local DB incomplete (missing: {', '.join(sorted(missing))}). Rebuilding from source…")
+            conn.close()
+            try:
+                DB_PATH.unlink()
+            except OSError:
+                pass
+            return _rebuild_from_source()
+
+    return _rebuild_from_source()
+
+
+def clear_data_cache():
+    """NEW: powers the sidebar Refresh Data button."""
+    load_data.clear()
+
+
 with st.spinner(""):
     conn, TABLE_MAP = load_data()
 
@@ -597,13 +673,34 @@ df_map_txn  = TABLE_MAP.get("map_transaction",        pd.DataFrame())
 df_top_txn  = TABLE_MAP.get("top_transaction",        pd.DataFrame())
 
 # ── Static (unfiltered) aggregations ─────────────────────────────────────────
-df_brand     = sql("SELECT brand, SUM(brand_count) AS total_users FROM aggregated_user GROUP BY brand ORDER BY total_users DESC")
-df_user_raw  = sql("SELECT state, year, quarter, MAX(registered_users) AS reg, MAX(app_opens) AS opens FROM aggregated_user GROUP BY state, year, quarter")
+# FIX 5 (NEW): built from TABLE_MAP via pandas instead of raw SQL against
+# `conn`. Raw sql("... FROM aggregated_user ...") would hard-crash the entire
+# app if that one table was ever missing. This degrades gracefully instead.
+if not df_agg_user.empty:
+    df_brand = (
+        df_agg_user.groupby("brand", as_index=False)["brand_count"]
+        .sum()
+        .rename(columns={"brand_count": "total_users"})
+        .sort_values("total_users", ascending=False)
+    )
+    df_user_raw = (
+        df_agg_user.groupby(["state", "year", "quarter"], as_index=False)
+        .agg(reg=("registered_users", "max"), opens=("app_opens", "max"))
+    )
+else:
+    st.error("⚠️ `aggregated_user` table is empty this run — device/engagement charts will be unavailable.")
+    df_brand = pd.DataFrame(columns=["brand", "total_users"])
+    df_user_raw = pd.DataFrame(columns=["state", "year", "quarter", "reg", "opens"])
+
 _df_user_all = df_user_raw.groupby("state", as_index=False).agg(total_registered=("reg","sum"), total_app_opens=("opens","sum"))
 _df_user_all["engagement_rate"] = (_df_user_all["total_app_opens"] / _df_user_all["total_registered"].replace(0, np.nan)).round(2)
 
 if not df_agg_ins.empty:
-    df_ins_trend = sql("SELECT year, quarter, SUM(insurance_count) AS total_ins_count, SUM(insurance_amount) AS total_ins_amount FROM aggregated_insurance GROUP BY year, quarter ORDER BY year, quarter")
+    df_ins_trend = (
+        df_agg_ins.groupby(["year", "quarter"], as_index=False)
+        .agg(total_ins_count=("insurance_count", "sum"), total_ins_amount=("insurance_amount", "sum"))
+        .sort_values(["year", "quarter"])
+    )
     df_ins_trend["year_quarter"] = df_ins_trend["year"].astype(str) + "-Q" + df_ins_trend["quarter"].astype(str)
 else:
     df_ins_trend = pd.DataFrame()
@@ -666,6 +763,25 @@ with st.sidebar:
         """, unsafe_allow_html=True)
 
     st.markdown("<hr>", unsafe_allow_html=True)
+
+    # NEW: Refresh Data button — clears @st.cache_resource so a bad/partial
+    # local db can be force-rebuilt without needing a redeploy.
+    if st.button("🔄  Refresh Data", use_container_width=True):
+        clear_data_cache()
+        st.rerun()
+
+    # NEW: data freshness caption
+    total_rows = sum(len(d) for d in TABLE_MAP.values())
+    db_modified = (
+        datetime.fromtimestamp(DB_PATH.stat().st_mtime).strftime("%d %b %Y, %H:%M")
+        if DB_PATH.exists() else "N/A"
+    )
+    st.markdown(
+        f'<div class="freshness-caption">📦 {total_rows:,} rows loaded<br>🕒 DB updated: {db_modified}</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown(f'<div style="font-size:11px;color:{C_MUTED};line-height:1.8;">Source: <a href="https://github.com/PhonePe/pulse" style="color:{C_ACCENT};text-decoration:none;font-weight:500;">PhonePe Pulse</a><br>India · 2018–2023 · SQLite</div>', unsafe_allow_html=True)
 
 
@@ -699,7 +815,6 @@ def get_filtered_aggs():
     df_tq = ft.groupby(["year","quarter","transaction_type"], as_index=False).agg(
         amount=("transaction_amount","sum")
     ).sort_values(["year","quarter"])
-    # year_quarter is built here — no need to add it again outside this function
     df_tq["year_quarter"] = df_tq["year"].astype(str) + "-Q" + df_tq["quarter"].astype(str)
 
     df_y = ft.groupby("year", as_index=False).agg(
@@ -722,17 +837,6 @@ def get_filtered_aggs():
 
 # Pre-compute for this render
 df_state_total, df_type_total, df_quarterly, df_type_q, df_yoy, df_seas, df_user_state = get_filtered_aggs()
-
-# FIX 2: Removed the dead outer block that was here in the original:
-#
-#   if not df_quarterly.empty and "year_quarter" not in df_type_q.columns:
-#       df_type_q["year_quarter"] = df_type_q["year"].astype(str) + "-Q" + df_type_q["quarter"].astype(str)
-#
-# That block was unreachable when df_type_q was non-empty (column already set
-# inside get_filtered_aggs). When df_type_q WAS empty, accessing .columns on
-# an empty DataFrame is safe, but the stacked chart (tab4) would later do
-# pivot_table on an empty df_type_q with no "year_quarter" key and crash.
-# The function already handles both cases correctly — nothing to add here.
 
 
 # ── Page Header ───────────────────────────────────────────────────────────────
@@ -758,14 +862,21 @@ st.markdown(f"""
 
 if "Overview" in page:
     c1, c2, c3, c4, c5 = st.columns(5)
-    total_val   = df_state_total["total_txn_amount"].sum()
-    total_cnt   = df_state_total["total_txn_count"].sum()
-    total_users = df_user_state["total_registered"].sum()
-    total_opens = df_user_state["total_app_opens"].sum()
+    total_val   = df_state_total["total_txn_amount"].sum() if not df_state_total.empty else 0
+    total_cnt   = df_state_total["total_txn_count"].sum() if not df_state_total.empty else 0
+    total_users = df_user_state["total_registered"].sum() if not df_user_state.empty else 0
+    total_opens = df_user_state["total_app_opens"].sum() if not df_user_state.empty else 0
     n_states    = len(df_state_total)
 
-    c1.metric("💰 Total Value",       f"₹{total_val/1e12:.1f}T")
-    c2.metric("🔢 Transactions",      f"{total_cnt/1e9:.2f}B")
+    # NEW: YoY delta badges — compares latest year vs previous year in the
+    # (unfiltered) yearly series so the KPI cards show real momentum.
+    delta_val = delta_cnt = None
+    if not df_yoy.empty and len(df_yoy) > 1:
+        delta_val = f"{df_yoy['amount_growth'].iloc[-1]:.1f}% YoY"
+        delta_cnt = f"{df_yoy['count_growth'].iloc[-1]:.1f}% YoY"
+
+    c1.metric("💰 Total Value",       f"₹{total_val/1e12:.1f}T", delta=delta_val)
+    c2.metric("🔢 Transactions",      f"{total_cnt/1e9:.2f}B",   delta=delta_cnt)
     c3.metric("👥 Registered Users",  f"{total_users/1e6:.0f}M")
     c4.metric("📲 App Opens",         f"{total_opens/1e9:.1f}B")
     c5.metric("🗺️ States Covered",    str(n_states))
@@ -820,10 +931,20 @@ if "Overview" in page:
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(f'<div style="font-size:10px;font-weight:600;color:{C_MUTED2};letter-spacing:0.14em;text-transform:uppercase;margin-bottom:10px;">Dataset Tables</div>', unsafe_allow_html=True)
-        st.dataframe(pd.DataFrame([
+        tables_df = pd.DataFrame([
             {"Table": n, "Rows": f"{len(d):,}", "Cols": len(d.columns)}
             for n, d in TABLE_MAP.items()
-        ]), use_container_width=True, hide_index=True)
+        ])
+        st.dataframe(tables_df, use_container_width=True, hide_index=True)
+
+        # NEW: quick export of the table summary
+        st.download_button(
+            "⬇️  Export Table Summary (CSV)",
+            data=to_csv_bytes(tables_df),
+            file_name="phonepe_dataset_summary.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 
 elif "Transactions" in page:
@@ -841,6 +962,14 @@ elif "Transactions" in page:
             with col2:
                 n = st.slider("Top N", 5, 36, 12)
                 metric_choice = st.radio("Metric", ["Amount", "Count"], index=0)
+                # NEW: export the currently-viewed top-N slice
+                st.download_button(
+                    "⬇️  Export CSV",
+                    data=to_csv_bytes(sg.sort_values("total_txn_amount", ascending=False)),
+                    file_name="phonepe_states_transactions.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
             with col1:
                 metric_col = "total_txn_amount" if metric_choice == "Amount" else "total_txn_count"
                 top = sg.nlargest(n, metric_col).sort_values(metric_col)
@@ -914,9 +1043,6 @@ elif "Transactions" in page:
         insight("Exponential post-2020 surge. Amount growth outpacing count signals a maturing, higher-value user base.")
 
     with tab4:
-        # FIX 2 (continued): df_type_q already has year_quarter from get_filtered_aggs().
-        # The original outer re-assignment block has been removed.
-        # Guard against empty df_type_q gracefully.
         if df_type_q.empty:
             st.warning("No transaction type data for selected filters.")
         else:
@@ -948,98 +1074,107 @@ elif "Users" in page:
     tab1, tab2, tab3 = st.tabs(["  Brand Share  ", "  Engagement by State  ", "  Reg vs App Opens  "])
 
     with tab1:
-        c1, c2 = st.columns(2)
-        top_brands = df_brand.head(12)
+        if df_brand.empty:
+            st.info("Device brand data unavailable this run.")
+        else:
+            c1, c2 = st.columns(2)
+            top_brands = df_brand.head(12)
 
-        fig1 = px.bar(top_brands, x="brand", y="total_users",
-            title="Registered Users by Device Brand",
-            color="total_users",
-            color_continuous_scale=[[0, C_INDIGO], [0.5, C_PURPLE], [1, C_PINK]],
-            labels={"brand": "Brand", "total_users": "Users"},
-            text=top_brands["total_users"].apply(lambda x: f"{x/1e6:.1f}M"))
-        fig1.update_traces(textposition="outside", textfont_size=10,
-            marker=dict(line=dict(width=0)))
-        fig1.update_layout(**layout(
-            height=400,
-            coloraxis_showscale=False,
-            xaxis=dict(tickangle=-30, gridcolor="rgba(0,0,0,0)", color=C_MUTED),
-            yaxis=dict(gridcolor=C_BORDER, color=C_MUTED),
-        ))
-        c1.plotly_chart(fig1, use_container_width=True)
+            fig1 = px.bar(top_brands, x="brand", y="total_users",
+                title="Registered Users by Device Brand",
+                color="total_users",
+                color_continuous_scale=[[0, C_INDIGO], [0.5, C_PURPLE], [1, C_PINK]],
+                labels={"brand": "Brand", "total_users": "Users"},
+                text=top_brands["total_users"].apply(lambda x: f"{x/1e6:.1f}M"))
+            fig1.update_traces(textposition="outside", textfont_size=10,
+                marker=dict(line=dict(width=0)))
+            fig1.update_layout(**layout(
+                height=400,
+                coloraxis_showscale=False,
+                xaxis=dict(tickangle=-30, gridcolor="rgba(0,0,0,0)", color=C_MUTED),
+                yaxis=dict(gridcolor=C_BORDER, color=C_MUTED),
+            ))
+            c1.plotly_chart(fig1, use_container_width=True)
 
-        fig2 = px.pie(top_brands, values="total_users", names="brand",
-            title="Brand Market Share", hole=0.48,
-            color_discrete_sequence=[C_PURPLE, C_INDIGO, C_PINK, C_TEAL, C_ORANGE,
-                                      "#34D399", "#FBBF24", "#60A5FA", "#F87171",
-                                      "#A78BFA", "#6EE7B7", "#FCD34D"])
-        fig2.update_traces(marker=dict(line=dict(color=C_CARD, width=2)))
-        fig2.update_layout(**layout(
-            height=400,
-            margin=dict(l=16, r=16, t=48, b=16),
-            legend=dict(orientation="v", font=dict(size=10, color=C_MUTED)),
-        ))
-        c2.plotly_chart(fig2, use_container_width=True)
-        insight("Xiaomi leads, followed by Samsung and Vivo — mirrors India's OEM landscape. OEM bundling agreements can drive step-change growth.")
+            fig2 = px.pie(top_brands, values="total_users", names="brand",
+                title="Brand Market Share", hole=0.48,
+                color_discrete_sequence=[C_PURPLE, C_INDIGO, C_PINK, C_TEAL, C_ORANGE,
+                                          "#34D399", "#FBBF24", "#60A5FA", "#F87171",
+                                          "#A78BFA", "#6EE7B7", "#FCD34D"])
+            fig2.update_traces(marker=dict(line=dict(color=C_CARD, width=2)))
+            fig2.update_layout(**layout(
+                height=400,
+                margin=dict(l=16, r=16, t=48, b=16),
+                legend=dict(orientation="v", font=dict(size=10, color=C_MUTED)),
+            ))
+            c2.plotly_chart(fig2, use_container_width=True)
+            insight("Xiaomi leads, followed by Samsung and Vivo — mirrors India's OEM landscape. OEM bundling agreements can drive step-change growth.")
 
     with tab2:
-        col1, col2 = st.columns([4, 1])
-        with col2:
-            n_e = st.slider("Top N", 10, len(df_user_state), 15)
-        with col1:
-            top_e = df_user_state.nlargest(n_e, "engagement_rate")
-            avg_e = df_user_state["engagement_rate"].mean()
-            fig = px.bar(top_e.sort_values("engagement_rate"), x="engagement_rate", y="state",
-                orientation="h",
-                title=f"Engagement Rate — Top {n_e} States (App Opens / Registered Users)",
-                color="engagement_rate",
-                color_continuous_scale=[[0, C_INDIGO], [0.5, C_PURPLE], [1, C_PINK]],
-                text=top_e.sort_values("engagement_rate")["engagement_rate"].apply(lambda x: f"{x:.1f}×"),
-                labels={"state": "", "engagement_rate": "Rate"})
-            fig.add_vline(x=avg_e, line_dash="dash", line_color=C_ORANGE,
-                annotation_text=f"Avg {avg_e:.1f}×",
-                annotation_font_color=C_ORANGE,
-                annotation_font_size=11)
-            fig.update_traces(textposition="outside", textfont_size=10,
-                marker=dict(line=dict(width=0)))
-            fig.update_layout(**layout(
-                height=520,
-                coloraxis_showscale=False,
-                yaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_TEXT2),
-                xaxis=dict(gridcolor=C_BORDER, color=C_MUTED),
-            ))
-            st.plotly_chart(fig, use_container_width=True)
-        insight("Delhi, Chandigarh, Goa lead on engagement. UP and Bihar have millions of registered users but low opens — prime re-activation targets.")
+        if df_user_state.empty:
+            st.info("Engagement data unavailable this run.")
+        else:
+            col1, col2 = st.columns([4, 1])
+            with col2:
+                n_e = st.slider("Top N", 10, len(df_user_state), min(15, len(df_user_state)))
+            with col1:
+                top_e = df_user_state.nlargest(n_e, "engagement_rate")
+                avg_e = df_user_state["engagement_rate"].mean()
+                fig = px.bar(top_e.sort_values("engagement_rate"), x="engagement_rate", y="state",
+                    orientation="h",
+                    title=f"Engagement Rate — Top {n_e} States (App Opens / Registered Users)",
+                    color="engagement_rate",
+                    color_continuous_scale=[[0, C_INDIGO], [0.5, C_PURPLE], [1, C_PINK]],
+                    text=top_e.sort_values("engagement_rate")["engagement_rate"].apply(lambda x: f"{x:.1f}×"),
+                    labels={"state": "", "engagement_rate": "Rate"})
+                fig.add_vline(x=avg_e, line_dash="dash", line_color=C_ORANGE,
+                    annotation_text=f"Avg {avg_e:.1f}×",
+                    annotation_font_color=C_ORANGE,
+                    annotation_font_size=11)
+                fig.update_traces(textposition="outside", textfont_size=10,
+                    marker=dict(line=dict(width=0)))
+                fig.update_layout(**layout(
+                    height=520,
+                    coloraxis_showscale=False,
+                    yaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_TEXT2),
+                    xaxis=dict(gridcolor=C_BORDER, color=C_MUTED),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+            insight("Delhi, Chandigarh, Goa lead on engagement. UP and Bihar have millions of registered users but low opens — prime re-activation targets.")
 
     with tab3:
-        fig = px.scatter(df_user_state, x="total_registered", y="total_app_opens",
-            color="engagement_rate", size="total_registered",
-            hover_name="state", text="state",
-            title="Registered Users vs App Opens — State Level",
-            color_continuous_scale=[[0, C_INDIGO], [0.5, C_PURPLE], [1, C_PINK]],
-            labels={"total_registered": "Registered Users", "total_app_opens": "App Opens", "engagement_rate": "Engagement"})
-        fig.update_traces(textposition="top center", textfont_size=8,
-            selector=dict(mode="markers+text"))
-        _x = df_user_state["total_registered"].values
-        _y = df_user_state["total_app_opens"].values
-        _mask = ~(np.isnan(_x) | np.isnan(_y))
-        if _mask.sum() > 1:
-            _m, _b = np.polyfit(_x[_mask], _y[_mask], 1)
-            _xs = np.array([_x[_mask].min(), _x[_mask].max()])
-            fig.add_trace(go.Scatter(
-                x=_xs, y=_m * _xs + _b,
-                mode="lines", name="Trend",
-                line=dict(color=C_ORANGE, width=2, dash="dot"),
-                hoverinfo="skip"
+        if df_user_state.empty:
+            st.info("Engagement data unavailable this run.")
+        else:
+            fig = px.scatter(df_user_state, x="total_registered", y="total_app_opens",
+                color="engagement_rate", size="total_registered",
+                hover_name="state", text="state",
+                title="Registered Users vs App Opens — State Level",
+                color_continuous_scale=[[0, C_INDIGO], [0.5, C_PURPLE], [1, C_PINK]],
+                labels={"total_registered": "Registered Users", "total_app_opens": "App Opens", "engagement_rate": "Engagement"})
+            fig.update_traces(textposition="top center", textfont_size=8,
+                selector=dict(mode="markers+text"))
+            _x = df_user_state["total_registered"].values
+            _y = df_user_state["total_app_opens"].values
+            _mask = ~(np.isnan(_x) | np.isnan(_y))
+            if _mask.sum() > 1:
+                _m, _b = np.polyfit(_x[_mask], _y[_mask], 1)
+                _xs = np.array([_x[_mask].min(), _x[_mask].max()])
+                fig.add_trace(go.Scatter(
+                    x=_xs, y=_m * _xs + _b,
+                    mode="lines", name="Trend",
+                    line=dict(color=C_ORANGE, width=2, dash="dot"),
+                    hoverinfo="skip"
+                ))
+            fig.update_layout(**layout(
+                height=540,
+                coloraxis_colorbar=dict(
+                    title=dict(text="Rate", font=dict(color=C_MUTED)),
+                    tickfont=dict(color=C_MUTED),
+                ),
             ))
-        fig.update_layout(**layout(
-            height=540,
-            coloraxis_colorbar=dict(
-                title=dict(text="Rate", font=dict(color=C_MUTED)),
-                tickfont=dict(color=C_MUTED),
-            ),
-        ))
-        st.plotly_chart(fig, use_container_width=True)
-        insight("Strong overall correlation. States below the trend line = direct revenue leakage — re-activation campaigns have near-zero acquisition cost.")
+            st.plotly_chart(fig, use_container_width=True)
+            insight("Strong overall correlation. States below the trend line = direct revenue leakage — re-activation campaigns have near-zero acquisition cost.")
 
 
 elif "Geographic" in page:
@@ -1047,10 +1182,12 @@ elif "Geographic" in page:
 
     with tab1:
         if not df_map_txn.empty:
-            df_d = sql("""
-                SELECT state || ' — ' || district AS sd, SUM(transaction_amount) AS total_amount
-                FROM map_transaction GROUP BY state, district ORDER BY total_amount DESC LIMIT 20
-            """)
+            df_d = (
+                df_map_txn.assign(sd=df_map_txn["state"] + " — " + df_map_txn["district"])
+                .groupby("sd", as_index=False)["transaction_amount"].sum()
+                .rename(columns={"transaction_amount": "total_amount"})
+                .sort_values("total_amount", ascending=False).head(20)
+            )
             fig = px.bar(df_d.sort_values("total_amount"), x="total_amount", y="sd",
                 orientation="h",
                 title="Top 20 Districts — Transaction Amount",
@@ -1128,22 +1265,18 @@ elif "Insurance" in page:
             insight("Surged post-2020. India's insurance penetration is ~4% of GDP vs 11% in developed markets — massive headroom for contextual cross-sell.")
 
         with tab2:
-            if not TABLE_MAP.get("aggregated_insurance", pd.DataFrame()).empty:
-                # FIX 3: Apply sel_years and sel_quarters filters to insurance top-states query.
-                # The original query had no WHERE clause, silently ignoring sidebar filters.
-                yr_list  = ",".join(str(y) for y in sel_years)
-                q_list   = ",".join(str(q) for q in sel_quarters)
-                ins_s = sql(f"""
-                    SELECT state, SUM(insurance_amount) AS amt
-                    FROM aggregated_insurance
-                    WHERE year IN ({yr_list}) AND quarter IN ({q_list})
-                    GROUP BY state
-                    ORDER BY amt DESC
-                    LIMIT 15
-                """)
-                if ins_s.empty:
+            if not df_agg_ins.empty:
+                ins_filtered = df_agg_ins[
+                    df_agg_ins["year"].isin(sel_years) & df_agg_ins["quarter"].isin(sel_quarters)
+                ]
+                if ins_filtered.empty:
                     st.warning("No insurance data for the selected year/quarter filters.")
                 else:
+                    ins_s = (
+                        ins_filtered.groupby("state", as_index=False)["insurance_amount"]
+                        .sum().rename(columns={"insurance_amount": "amt"})
+                        .sort_values("amt", ascending=False).head(15)
+                    )
                     fig = px.bar(ins_s.sort_values("amt"), x="amt", y="state", orientation="h",
                         title="Top 15 States — Insurance Premium (filtered)",
                         color="amt",
@@ -1165,82 +1298,91 @@ elif "Growth" in page:
     tab1, tab2, tab3 = st.tabs(["  YoY Growth  ", "  Seasonality  ", "  Distribution  "])
 
     with tab1:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=df_yoy["year"].astype(str), y=df_yoy["count_growth"].fillna(0),
-            name="Count Growth %",
-            marker_color=C_PURPLE,
-            marker=dict(line=dict(width=0)),
-            opacity=0.88,
-            text=df_yoy["count_growth"].fillna(0).apply(lambda x: f"{x:.0f}%"),
-            textposition="outside", textfont_size=11
-        ))
-        fig.add_trace(go.Bar(
-            x=df_yoy["year"].astype(str), y=df_yoy["amount_growth"].fillna(0),
-            name="Amount Growth %",
-            marker_color=C_ORANGE,
-            marker=dict(line=dict(width=0)),
-            opacity=0.88,
-            text=df_yoy["amount_growth"].fillna(0).apply(lambda x: f"{x:.0f}%"),
-            textposition="outside", textfont_size=11
-        ))
-        fig.add_hline(y=0, line_color=C_MUTED2, line_width=0.8)
-        fig.update_layout(**layout(
-            barmode="group",
-            title="Year-over-Year Transaction Growth Rate",
-            height=440,
-            yaxis=dict(title="Growth (%)", gridcolor=C_BORDER, color=C_MUTED),
-            xaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_MUTED),
-        ))
-        st.plotly_chart(fig, use_container_width=True)
-        insight("2020–21 = peak COVID surge. Moderating post-2021 from a higher base. Amount consistently outpacing count confirms maturing user base.")
-
-    with tab2:
-        q_labels = ["Q1 (Jan–Mar)", "Q2 (Apr–Jun)", "Q3 (Jul–Sep)", "Q4 (Oct–Dec)"]
-        colors_q = [C_TEAL, C_PURPLE, C_INDIGO, C_ORANGE]
-        c1, c2 = st.columns(2)
-        for ax, y_col, title, ytitle in [
-            (c1, "avg_count",  "Avg Transaction Count by Quarter", "Avg Count (K)"),
-            (c2, "avg_amount", "Avg Transaction Amount by Quarter", "Avg Amount (₹M)")
-        ]:
-            scale = 1e3 if "count" in y_col else 1e6
-            fig = px.bar(x=q_labels, y=df_seas[y_col]/scale, title=title,
-                color=q_labels, color_discrete_sequence=colors_q,
-                labels={"x": "Quarter", "y": ytitle},
-                text=(df_seas[y_col]/scale).apply(lambda x: f"{x:.0f}"))
-            fig.update_traces(textposition="outside", textfont_size=11,
-                marker=dict(line=dict(width=0)))
+        if df_yoy.empty:
+            st.warning("No data for selected filters.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=df_yoy["year"].astype(str), y=df_yoy["count_growth"].fillna(0),
+                name="Count Growth %",
+                marker_color=C_PURPLE,
+                marker=dict(line=dict(width=0)),
+                opacity=0.88,
+                text=df_yoy["count_growth"].fillna(0).apply(lambda x: f"{x:.0f}%"),
+                textposition="outside", textfont_size=11
+            ))
+            fig.add_trace(go.Bar(
+                x=df_yoy["year"].astype(str), y=df_yoy["amount_growth"].fillna(0),
+                name="Amount Growth %",
+                marker_color=C_ORANGE,
+                marker=dict(line=dict(width=0)),
+                opacity=0.88,
+                text=df_yoy["amount_growth"].fillna(0).apply(lambda x: f"{x:.0f}%"),
+                textposition="outside", textfont_size=11
+            ))
+            fig.add_hline(y=0, line_color=C_MUTED2, line_width=0.8)
             fig.update_layout(**layout(
-                showlegend=False,
-                height=370,
-                yaxis=dict(title=ytitle, gridcolor=C_BORDER, color=C_MUTED),
+                barmode="group",
+                title="Year-over-Year Transaction Growth Rate",
+                height=440,
+                yaxis=dict(title="Growth (%)", gridcolor=C_BORDER, color=C_MUTED),
                 xaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_MUTED),
             ))
-            ax.plotly_chart(fig, use_container_width=True)
-        insight("Q4 peaks every year — Diwali + Dussehra + year-end spending. Pre-emptive capacity scaling from September is operationally critical.")
+            st.plotly_chart(fig, use_container_width=True)
+            insight("2020–21 = peak COVID surge. Moderating post-2021 from a higher base. Amount consistently outpacing count confirms maturing user base.")
+
+    with tab2:
+        if df_seas.empty:
+            st.warning("No data for selected filters.")
+        else:
+            q_labels = ["Q1 (Jan–Mar)", "Q2 (Apr–Jun)", "Q3 (Jul–Sep)", "Q4 (Oct–Dec)"]
+            colors_q = [C_TEAL, C_PURPLE, C_INDIGO, C_ORANGE]
+            c1, c2 = st.columns(2)
+            for ax, y_col, title, ytitle in [
+                (c1, "avg_count",  "Avg Transaction Count by Quarter", "Avg Count (K)"),
+                (c2, "avg_amount", "Avg Transaction Amount by Quarter", "Avg Amount (₹M)")
+            ]:
+                scale = 1e3 if "count" in y_col else 1e6
+                fig = px.bar(x=q_labels, y=df_seas[y_col]/scale, title=title,
+                    color=q_labels, color_discrete_sequence=colors_q,
+                    labels={"x": "Quarter", "y": ytitle},
+                    text=(df_seas[y_col]/scale).apply(lambda x: f"{x:.0f}"))
+                fig.update_traces(textposition="outside", textfont_size=11,
+                    marker=dict(line=dict(width=0)))
+                fig.update_layout(**layout(
+                    showlegend=False,
+                    height=370,
+                    yaxis=dict(title=ytitle, gridcolor=C_BORDER, color=C_MUTED),
+                    xaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_MUTED),
+                ))
+                ax.plotly_chart(fig, use_container_width=True)
+            insight("Q4 peaks every year — Diwali + Dussehra + year-end spending. Pre-emptive capacity scaling from September is operationally critical.")
 
     with tab3:
-        fig = go.Figure()
-        box_colors = [C_PURPLE, C_INDIGO, C_PINK, C_GREEN, C_ORANGE]
-        for i, typ in enumerate(df_agg_txn["transaction_type"].unique()):
-            data = df_agg_txn[df_agg_txn["transaction_type"] == typ]["transaction_amount"].values
-            fig.add_trace(go.Box(
-                y=data, name=typ,
-                marker_color=box_colors[i % len(box_colors)],
-                line=dict(color=box_colors[i % len(box_colors)]),
-                fillcolor=f"rgba({int(box_colors[i%len(box_colors)][1:3],16)},{int(box_colors[i%len(box_colors)][3:5],16)},{int(box_colors[i%len(box_colors)][5:7],16)},0.15)",
-                boxmean="sd",
-                opacity=0.9,
-                hovertemplate=f"<b>{typ}</b><br>%{{y:,.0f}}<extra></extra>"
+        if df_agg_txn.empty:
+            st.warning("No transaction data available.")
+        else:
+            fig = go.Figure()
+            box_colors = [C_PURPLE, C_INDIGO, C_PINK, C_GREEN, C_ORANGE]
+            for i, typ in enumerate(df_agg_txn["transaction_type"].unique()):
+                data = df_agg_txn[df_agg_txn["transaction_type"] == typ]["transaction_amount"].values
+                fig.add_trace(go.Box(
+                    y=data, name=typ,
+                    marker_color=box_colors[i % len(box_colors)],
+                    line=dict(color=box_colors[i % len(box_colors)]),
+                    fillcolor=f"rgba({int(box_colors[i%len(box_colors)][1:3],16)},{int(box_colors[i%len(box_colors)][3:5],16)},{int(box_colors[i%len(box_colors)][5:7],16)},0.15)",
+                    boxmean="sd",
+                    opacity=0.9,
+                    hovertemplate=f"<b>{typ}</b><br>%{{y:,.0f}}<extra></extra>"
+                ))
+            fig.update_yaxes(type="log", title="Transaction Amount (₹, log scale)", gridcolor=C_BORDER, color=C_MUTED)
+            fig.update_layout(**layout(
+                title="Transaction Amount Distribution by Type — Box Plot (log scale)",
+                height=470,
+                xaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_MUTED),
             ))
-        fig.update_yaxes(type="log", title="Transaction Amount (₹, log scale)", gridcolor=C_BORDER, color=C_MUTED)
-        fig.update_layout(**layout(
-            title="Transaction Amount Distribution by Type — Box Plot (log scale)",
-            height=470,
-            xaxis=dict(gridcolor="rgba(0,0,0,0)", color=C_MUTED),
-        ))
-        st.plotly_chart(fig, use_container_width=True)
-        insight("Financial Services = widest IQR and highest outliers. Per-type fraud detection thresholds significantly reduce false positives.")
+            st.plotly_chart(fig, use_container_width=True)
+            insight("Financial Services = widest IQR and highest outliers. Per-type fraud detection thresholds significantly reduce false positives.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────
